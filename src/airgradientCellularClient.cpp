@@ -396,11 +396,13 @@ void AirgradientCellularClient::_serialize(
       }
       oss << ",";
       // Working Electrode NO2
+      bool isDgsxNo2 = (!IS_VOLT_VALID(no2AuxiliaryElectrode)) && IS_VOLT_VALID(no2WorkingElectrode);
       if (IS_VOLT_VALID(no2WorkingElectrode)) {
+        // Both DGSx (ppb) and AlphaSense (V) need to be multiplied by 1000 for server
         oss << std::round(no2WorkingElectrode * 1000);
       }
       oss << ",";
-      // Auxiliary Electrode NO2
+      // Auxiliary Electrode NO2 (skip for DGSx)
       if (IS_VOLT_VALID(no2AuxiliaryElectrode)) {
         oss << std::round(no2AuxiliaryElectrode * 1000);
       }

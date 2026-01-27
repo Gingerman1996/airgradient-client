@@ -43,6 +43,7 @@ public:
     float no2WorkingElectrode;
     float no2AuxiliaryElectrode;
     float afeTemp;
+    float dgsxGasConcentration;
   };
 
   enum PayloadType {
