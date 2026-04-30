@@ -98,6 +98,24 @@ CellResult<CellularModule::UdpPacket> CellularModule::udpReceive(uint32_t timeou
   return CellResult<UdpPacket>();
 }
 
+bool CellularModule::gnssPowerOn(bool useHotStart, uint32_t readyTimeoutMs) { return false; }
+
+bool CellularModule::gnssPowerOff(bool saveHotStartCache) { return false; }
+
+bool CellularModule::gnssColdStart() { return false; }
+
+bool CellularModule::gnssHotStart() { return false; }
+
+bool CellularModule::gnssAgps() { return false; }
+
+CellResult<CellularModule::GnssFix> CellularModule::gnssGetFix(uint32_t fixTimeoutMs,
+                                                                GnssTickCb onTick) {
+  CellResult<GnssFix> result;
+  result.status = CellReturnStatus::Failed;
+  result.data.valid = false;
+  return result;
+}
+
 int CellularModule::csqToDbm(int csq) {
   if (csq == 99) {
     // Unknown or undetectable

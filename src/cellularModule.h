@@ -9,6 +9,7 @@
 #define CELLULAR_MODULE_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,16 @@ public:
   struct UdpPacket {
     std::vector<uint8_t> buff;
     int size;
+  };
+
+  // GNSS fix returned by AT+CGNSSINFO
+  struct GnssFix {
+    bool valid;             // true when latitude/longitude are populated
+    double latitude;        // decimal degrees, +N / -S
+    double longitude;       // decimal degrees, +E / -W
+    float altitudeMeters;   // MSL altitude
+    char dateUTC[7];        // "ddmmyy", null-terminated
+    char timeUTC[10];       // "hhmmss.ss", null-terminated
   };
 
   // URL, Headers opt?, conn timeout, recv timeout,
@@ -79,6 +90,26 @@ public:
   virtual CellReturnStatus mqttDisconnect();
   virtual CellReturnStatus mqttPublish(const std::string &topic, const std::string &payload,
                                        int qos = 1, int retain = 0, int timeoutS = 15);
+
+  // GNSS subsystem control. Default base implementations are no-ops returning
+  // failure; concrete modems with on-board GNSS (e.g. A76XX) override these.
+  // Powers on GNSS and applies mode/NMEA configuration as per the working
+  // feature/GNSS reference (see GNSS_Testing_Guide.md): CGNSSMODE=3 (GPS+QZSS),
+  // CGNSSNMEA, CGPSNMEARATE=1.
+  virtual bool gnssPowerOn(bool useHotStart = true, uint32_t readyTimeoutMs = 15000);
+  virtual bool gnssPowerOff(bool saveHotStartCache = true);
+  // Cold start: clear any cached almanac/ephemeris and re-acquire from scratch.
+  virtual bool gnssColdStart();
+  // Hot start: reuse cached data for fastest TTFF.
+  virtual bool gnssHotStart();
+  // Pull AGPS assistance data via cellular network (AT+CAGPS). Requires a
+  // working data connection. Best-effort — non-fatal on failure.
+  virtual bool gnssAgps();
+  // Optional per-poll callback (e.g. to kick an external watchdog while waiting
+  // for a fix). Invoked after every poll iteration (~1s).
+  using GnssTickCb = std::function<void()>;
+  virtual CellResult<GnssFix> gnssGetFix(uint32_t fixTimeoutMs = 90000,
+                                         GnssTickCb onTick = nullptr);
 
   virtual CellReturnStatus udpConnect(const std::string &host, int port = 5683);
   virtual CellReturnStatus udpDisconnect();

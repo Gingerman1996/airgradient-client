@@ -11,8 +11,10 @@
 #include "freertos/projdefs.h"
 #include "cellularModuleA7672xx.h"
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <cstring>
+#include <vector>
 
 #include "common.h"
 #include "agLogger.h"
@@ -2288,6 +2290,255 @@ uint32_t CellularModuleA7672XX::getCurrentOperatorId() const {
 
 uint32_t CellularModuleA7672XX::getRegistrationFailCount() const {
   return registrationFailCount_;
+}
+
+// ---------------------------------------------------------------------------
+// GNSS (A76XX manual §24)
+// ---------------------------------------------------------------------------
+
+bool CellularModuleA7672XX::gnssPowerOn(bool useHotStart, uint32_t readyTimeoutMs) {
+  // Minimum required sequence per A76XX manual §24:
+  //   1. AT+CGNSSPWR=1[,AP_Flash][,dynamic_load]
+  //   2. wait for URC "+CGNSSPWR: READY!"
+  // CGNSSMODE/CGNSSNMEA/CGPSNMEARATE are not needed for AT+CGNSSINFO polling
+  // (they only affect NMEA streaming via CGNSSTST=1) and their defaults
+  // (CGNSSMODE=3, CGPSNMEARATE=1) already match what we want.
+  if (useHotStart) {
+    at_->sendAT("+CGNSSPWR=1,1,1");
+  } else {
+    at_->sendAT("+CGNSSPWR=1");
+  }
+  if (at_->waitResponse() != ATCommandHandler::ExpArg1) {
+    AG_LOGE(TAG, "GNSS power on: AT+CGNSSPWR did not return OK");
+    return false;
+  }
+  if (at_->waitResponse(readyTimeoutMs, "+CGNSSPWR: READY!") != ATCommandHandler::ExpArg1) {
+    AG_LOGE(TAG, "GNSS power on: timed out waiting for READY URC");
+    return false;
+  }
+  AG_LOGI(TAG, "GNSS ready");
+  return true;
+}
+
+bool CellularModuleA7672XX::gnssColdStart() {
+  at_->sendAT("+CGPSCOLD");
+  if (at_->waitResponse() != ATCommandHandler::ExpArg1) {
+    AG_LOGW(TAG, "GNSS cold start: AT+CGPSCOLD did not return OK");
+    return false;
+  }
+  AG_LOGI(TAG, "GNSS cold start issued");
+  return true;
+}
+
+bool CellularModuleA7672XX::gnssHotStart() {
+  at_->sendAT("+CGPSHOT");
+  if (at_->waitResponse() != ATCommandHandler::ExpArg1) {
+    AG_LOGW(TAG, "GNSS hot start: AT+CGPSHOT did not return OK");
+    return false;
+  }
+  AG_LOGI(TAG, "GNSS hot start issued");
+  return true;
+}
+
+bool CellularModuleA7672XX::gnssAgps() {
+  // AGPS fetch can take several seconds while the modem pulls assistance data
+  // over HTTPS. Allow a generous timeout but treat any failure as non-fatal.
+  at_->sendAT("+CAGPS");
+  if (at_->waitResponse(30000) != ATCommandHandler::ExpArg1) {
+    AG_LOGW(TAG, "GNSS AGPS: AT+CAGPS did not return OK");
+    return false;
+  }
+  AG_LOGI(TAG, "GNSS AGPS data fetched");
+  return true;
+}
+
+bool CellularModuleA7672XX::gnssPowerOff(bool saveHotStartCache) {
+  // AT+CGNSSPWR=0,1 saves ephemeris/almanac to AP-Flash for next hot start.
+  if (saveHotStartCache) {
+    at_->sendAT("+CGNSSPWR=0,1");
+  } else {
+    at_->sendAT("+CGNSSPWR=0");
+  }
+  if (at_->waitResponse() != ATCommandHandler::ExpArg1) {
+    AG_LOGW(TAG, "GNSS power off: AT+CGNSSPWR=0 did not return OK");
+    return false;
+  }
+  return true;
+}
+
+CellResult<CellularModule::GnssFix>
+CellularModuleA7672XX::gnssGetFix(uint32_t fixTimeoutMs, GnssTickCb onTick) {
+  CellResult<GnssFix> result;
+  result.status = CellReturnStatus::Failed;
+  result.data.valid = false;
+
+  const uint32_t pollIntervalMs = 1000;
+  uint32_t elapsed = 0;
+  uint32_t pollCount = 0;
+
+  AG_LOGI(TAG, "GNSS: polling for fix (timeout %" PRIu32 " ms)", fixTimeoutMs);
+
+  while (elapsed < fixTimeoutMs) {
+    pollCount++;
+    if (onTick) onTick();
+    // Execution form: AT+CGNSSINFO -> "+CGNSSINFO: <fix>,<sat>,...,<lat>,<N/S>,<lon>,<E/W>,<date>,<UTC>,<alt>,..."
+    // For A76XX this returns the same shape as AT+CGPSINFO when no fix:
+    // "+CGNSSINFO: ,,,,,,,,". When fixed, all fields are populated.
+    at_->sendAT("+CGNSSINFO");
+    if (at_->waitResponse("+CGNSSINFO:") != ATCommandHandler::ExpArg1) {
+      AG_LOGW(TAG, "GNSS poll #%" PRIu32 ": AT+CGNSSINFO did not echo prefix",
+              pollCount);
+      // Drain any trailing OK/ERROR before retrying
+      at_->waitResponse(500);
+      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
+      elapsed += pollIntervalMs;
+      continue;
+    }
+
+    std::string line;
+    if (at_->waitAndRecvRespLine(line, 200) == -1) {
+      AG_LOGW(TAG, "GNSS poll #%" PRIu32 ": no response line after prefix",
+              pollCount);
+      at_->waitResponse(500);
+      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
+      elapsed += pollIntervalMs;
+      continue;
+    }
+    // Drain trailing OK
+    at_->waitResponse(1000);
+
+    AG_LOGI(TAG, "GNSS poll #%" PRIu32 " (%" PRIu32 "s): +CGNSSINFO:%s",
+            pollCount, elapsed / 1000, line.c_str());
+
+    // Mirror the working feature/GNSS approach: a complete fix has no empty
+    // fields, so the response contains no ",," sequence and doesn't end on a
+    // trailing comma. While unfixed the modem returns "+CGNSSINFO: ,,,,,,,,".
+    bool incomplete = line.empty() || line.find(",,") != std::string::npos ||
+                      line.front() == ',' || line.back() == ',';
+    if (incomplete) {
+      AG_LOGI(TAG, "GNSS poll #%" PRIu32 ": no fix yet", pollCount);
+      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
+      elapsed += pollIntervalMs;
+      continue;
+    }
+
+    // Now safe to parse. Split fields and find the N/S hemisphere token.
+    std::vector<std::string> fields;
+    {
+      std::string cur;
+      for (char c : line) {
+        if (c == ',') {
+          fields.push_back(cur);
+          cur.clear();
+        } else {
+          cur.push_back(c);
+        }
+      }
+      fields.push_back(cur);
+    }
+
+    int hemiIdx = -1;
+    for (size_t i = 0; i < fields.size(); ++i) {
+      if (fields[i] == "N" || fields[i] == "S") {
+        hemiIdx = static_cast<int>(i);
+        break;
+      }
+    }
+    if (hemiIdx < 1 || hemiIdx + 5 >= static_cast<int>(fields.size())) {
+      AG_LOGW(TAG,
+              "GNSS poll #%" PRIu32 ": complete payload but unexpected layout (fields=%zu)",
+              pollCount, fields.size());
+      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
+      elapsed += pollIntervalMs;
+      continue;
+    }
+
+    const std::string &latRaw = fields[hemiIdx - 1];
+    const std::string &nsRaw = fields[hemiIdx];
+    const std::string &lonRaw = fields[hemiIdx + 1];
+    const std::string &ewRaw = fields[hemiIdx + 2];
+    const std::string &dateRaw = fields[hemiIdx + 3];
+    const std::string &utcRaw = fields[hemiIdx + 4];
+    const std::string &altRaw = fields[hemiIdx + 5];
+
+    double lat = 0.0, lon = 0.0;
+    if (!_gnssParseCoord(latRaw, nsRaw, lat) ||
+        !_gnssParseCoord(lonRaw, ewRaw, lon)) {
+      AG_LOGW(TAG,
+              "GNSS poll #%" PRIu32 ": coord parse failed (lat=%s%s lon=%s%s)",
+              pollCount, latRaw.c_str(), nsRaw.c_str(), lonRaw.c_str(),
+              ewRaw.c_str());
+      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
+      elapsed += pollIntervalMs;
+      continue;
+    }
+
+    result.data.valid = true;
+    result.data.latitude = lat;
+    result.data.longitude = lon;
+    if (altRaw.empty()) {
+      result.data.altitudeMeters = 0.0f;
+    } else {
+      char *endp = nullptr;
+      float alt = std::strtof(altRaw.c_str(), &endp);
+      result.data.altitudeMeters = (endp == altRaw.c_str()) ? 0.0f : alt;
+    }
+    std::snprintf(result.data.dateUTC, sizeof(result.data.dateUTC), "%s", dateRaw.c_str());
+    std::snprintf(result.data.timeUTC, sizeof(result.data.timeUTC), "%s", utcRaw.c_str());
+    result.status = CellReturnStatus::Ok;
+    return result;
+  }
+
+  result.status = CellReturnStatus::Timeout;
+  return result;
+}
+
+bool CellularModuleA7672XX::_gnssExtractField(const std::string &csv, int idx, std::string &out) {
+  int curIdx = 0;
+  size_t start = 0;
+  for (size_t i = 0; i <= csv.size(); ++i) {
+    if (i == csv.size() || csv[i] == ',') {
+      if (curIdx == idx) {
+        out = csv.substr(start, i - start);
+        return !out.empty();
+      }
+      curIdx++;
+      start = i + 1;
+    }
+  }
+  return false;
+}
+
+bool CellularModuleA7672XX::_gnssParseCoord(const std::string &nmea, const std::string &hemi,
+                                            double &decimal) {
+  // NMEA latitude format: ddmm.mmmmmm  (2-digit degrees)
+  // NMEA longitude format: dddmm.mmmmmm (3-digit degrees)
+  if (nmea.empty() || hemi.empty()) {
+    return false;
+  }
+  size_t dot = nmea.find('.');
+  if (dot == std::string::npos || dot < 3) {
+    return false;
+  }
+  // Degrees = everything except the last 2 chars before '.'
+  size_t degLen = dot - 2;
+  std::string degStr = nmea.substr(0, degLen);
+  std::string minStr = nmea.substr(degLen);
+  char *endp = nullptr;
+  double deg = std::strtod(degStr.c_str(), &endp);
+  if (endp == degStr.c_str()) {
+    return false;
+  }
+  endp = nullptr;
+  double minutes = std::strtod(minStr.c_str(), &endp);
+  if (endp == minStr.c_str()) {
+    return false;
+  }
+  decimal = deg + minutes / 60.0;
+  if (hemi == "S" || hemi == "W") {
+    decimal = -decimal;
+  }
+  return true;
 }
 
 #endif // ESP8266

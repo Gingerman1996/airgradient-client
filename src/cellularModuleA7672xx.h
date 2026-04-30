@@ -117,6 +117,16 @@ public:
   CellReturnStatus mqttPublish(const std::string &topic, const std::string &payload, int qos = 1,
                                int retain = 0, int timeoutS = 15);
 
+  // GNSS subsystem control. Configuration sequence and CAGPS/CGPSCOLD/CGPSHOT
+  // mirrors the working feature/GNSS branch (GNSS_Testing_Guide.md).
+  bool gnssPowerOn(bool useHotStart = true, uint32_t readyTimeoutMs = 15000);
+  bool gnssPowerOff(bool saveHotStartCache = true);
+  bool gnssColdStart();
+  bool gnssHotStart();
+  bool gnssAgps();
+  CellResult<CellularModule::GnssFix> gnssGetFix(uint32_t fixTimeoutMs = 90000,
+                                                 GnssTickCb onTick = nullptr);
+
   CellReturnStatus udpConnect(const std::string &host, int port = 5683);
   CellReturnStatus udpDisconnect();
   CellReturnStatus udpSend(const CellularModule::UdpPacket &packet, const std::string &host,
@@ -172,6 +182,12 @@ private:
   CellReturnStatus _stopUDP();
   CellReturnStatus _connectUDP(const std::string &host, int port);
   CellReturnStatus _disconnectUDP();
+
+  // Parse one comma-separated field at index `idx` from `csv` into `out`.
+  // Returns false if the field is missing/empty.
+  bool _gnssExtractField(const std::string &csv, int idx, std::string &out);
+  // Convert NMEA "ddmm.mmmmmm" + hemisphere ("N"/"S"/"E"/"W") to decimal degrees.
+  bool _gnssParseCoord(const std::string &nmea, const std::string &hemi, double &decimal);
 
   int _mapCellTechToMode(CellTechnology ct);
   std::string _mapCellTechToNetworkRegisCmd(CellTechnology ct);
