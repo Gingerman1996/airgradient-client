@@ -108,6 +108,8 @@ bool CellularModule::gnssHotStart() { return false; }
 
 bool CellularModule::gnssAgps() { return false; }
 
+bool CellularModule::gnssEnableNmea(bool enable) { return false; }
+
 CellResult<CellularModule::GnssFix> CellularModule::gnssGetFix(uint32_t fixTimeoutMs,
                                                                 GnssTickCb onTick) {
   CellResult<GnssFix> result;

@@ -41,12 +41,16 @@ public:
     int size;
   };
 
-  // GNSS fix returned by AT+CGNSSINFO
+  // GNSS fix returned by AT+CGNSSINFO. The receiver typically acquires
+  // time-lock (date/UTC) before position-lock (lat/lon), so a "valid" fix may
+  // contain time only — useful for off-grid units that need a clock but don't
+  // care about position.
   struct GnssFix {
-    bool valid;             // true when latitude/longitude are populated
-    double latitude;        // decimal degrees, +N / -S
-    double longitude;       // decimal degrees, +E / -W
-    float altitudeMeters;   // MSL altitude
+    bool valid;             // true when at least date/UTC are populated
+    bool hasPosition;       // true when lat/lon/alt are also populated
+    double latitude;        // decimal degrees, +N / -S (only if hasPosition)
+    double longitude;       // decimal degrees, +E / -W (only if hasPosition)
+    float altitudeMeters;   // MSL altitude (only if hasPosition)
     char dateUTC[7];        // "ddmmyy", null-terminated
     char timeUTC[10];       // "hhmmss.ss", null-terminated
   };
@@ -105,6 +109,11 @@ public:
   // Pull AGPS assistance data via cellular network (AT+CAGPS). Requires a
   // working data connection. Best-effort — non-fatal on failure.
   virtual bool gnssAgps();
+  // Diagnostic: enable/disable raw NMEA streaming on the AT UART. Useful to
+  // inspect satellite SNR ($GPGSV) when AT+CGNSSINFO is not yielding fixes.
+  // While enabled, do not issue other GNSS AT commands — the response parser
+  // will collide with the NMEA stream.
+  virtual bool gnssEnableNmea(bool enable);
   // Optional per-poll callback (e.g. to kick an external watchdog while waiting
   // for a fix). Invoked after every poll iteration (~1s).
   using GnssTickCb = std::function<void()>;

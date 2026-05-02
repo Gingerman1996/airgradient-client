@@ -2352,6 +2352,30 @@ bool CellularModuleA7672XX::gnssAgps() {
   return true;
 }
 
+bool CellularModuleA7672XX::gnssEnableNmea(bool enable) {
+  if (enable) {
+    // Route NMEA to the AT UART. CGNSSPORTSWITCH is firmware-version-dependent
+    // on the A76XX line — treat it as best-effort. CGNSSTST=1 is the actual
+    // start trigger.
+    at_->sendAT("+CGNSSPORTSWITCH=0,1");
+    at_->waitResponse(2000);
+    at_->sendAT("+CGNSSTST=1");
+    if (at_->waitResponse() != ATCommandHandler::ExpArg1) {
+      AG_LOGW(TAG, "GNSS NMEA enable: AT+CGNSSTST=1 did not return OK");
+      return false;
+    }
+    AG_LOGI(TAG, "GNSS NMEA streaming enabled (raw $GPxxx will follow)");
+    return true;
+  }
+  at_->sendAT("+CGNSSTST=0");
+  if (at_->waitResponse() != ATCommandHandler::ExpArg1) {
+    AG_LOGW(TAG, "GNSS NMEA disable: AT+CGNSSTST=0 did not return OK");
+    return false;
+  }
+  AG_LOGI(TAG, "GNSS NMEA streaming disabled");
+  return true;
+}
+
 bool CellularModuleA7672XX::gnssPowerOff(bool saveHotStartCache) {
   // AT+CGNSSPWR=0,1 saves ephemeris/almanac to AP-Flash for next hot start.
   if (saveHotStartCache) {
@@ -2371,6 +2395,7 @@ CellularModuleA7672XX::gnssGetFix(uint32_t fixTimeoutMs, GnssTickCb onTick) {
   CellResult<GnssFix> result;
   result.status = CellReturnStatus::Failed;
   result.data.valid = false;
+  result.data.hasPosition = false;
 
   const uint32_t pollIntervalMs = 1000;
   uint32_t elapsed = 0;
@@ -2410,19 +2435,13 @@ CellularModuleA7672XX::gnssGetFix(uint32_t fixTimeoutMs, GnssTickCb onTick) {
     AG_LOGI(TAG, "GNSS poll #%" PRIu32 " (%" PRIu32 "s): +CGNSSINFO:%s",
             pollCount, elapsed / 1000, line.c_str());
 
-    // Mirror the working feature/GNSS approach: a complete fix has no empty
-    // fields, so the response contains no ",," sequence and doesn't end on a
-    // trailing comma. While unfixed the modem returns "+CGNSSINFO: ,,,,,,,,".
-    bool incomplete = line.empty() || line.find(",,") != std::string::npos ||
-                      line.front() == ',' || line.back() == ',';
-    if (incomplete) {
-      AG_LOGI(TAG, "GNSS poll #%" PRIu32 ": no fix yet", pollCount);
+    if (line.empty()) {
       vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
       elapsed += pollIntervalMs;
       continue;
     }
 
-    // Now safe to parse. Split fields and find the N/S hemisphere token.
+    // Split into fields. Empty fields between adjacent commas are preserved.
     std::vector<std::string> fields;
     {
       std::string cur;
@@ -2437,6 +2456,29 @@ CellularModuleA7672XX::gnssGetFix(uint32_t fixTimeoutMs, GnssTickCb onTick) {
       fields.push_back(cur);
     }
 
+    // CGNSSINFO field layout per A76XX manual §24.5:
+    //   <mode>,<GPS-SVs>,<GLO-SVs>,<BDS-SVs>,<lat>,<N/S>,<lon>,<E/W>,
+    //   <date>,<UTC-time>,<alt>,<speed>,<course>,<PDOP>,<HDOP>,<VDOP>
+    // The receiver typically populates date/UTC (indices 8,9) as soon as it
+    // achieves time-lock from any single satellite, before it has the 4-SV
+    // 3D fix needed to populate position. Accept time-only responses so units
+    // that never get a position fix (e.g. weak antenna, indoor) can still
+    // recover wall-clock time.
+    constexpr size_t kDateIdx = 8;
+    constexpr size_t kTimeIdx = 9;
+    const std::string dateRaw = fields.size() > kDateIdx ? fields[kDateIdx] : "";
+    const std::string utcRaw  = fields.size() > kTimeIdx ? fields[kTimeIdx] : "";
+    if (dateRaw.empty() || utcRaw.empty()) {
+      AG_LOGI(TAG, "GNSS poll #%" PRIu32 ": no time yet", pollCount);
+      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
+      elapsed += pollIntervalMs;
+      continue;
+    }
+
+    // Position is optional. Detected by presence of N/S hemisphere token.
+    bool hasPosition = false;
+    double lat = 0.0, lon = 0.0;
+    float alt = 0.0f;
     int hemiIdx = -1;
     for (size_t i = 0; i < fields.size(); ++i) {
       if (fields[i] == "N" || fields[i] == "S") {
@@ -2444,45 +2486,34 @@ CellularModuleA7672XX::gnssGetFix(uint32_t fixTimeoutMs, GnssTickCb onTick) {
         break;
       }
     }
-    if (hemiIdx < 1 || hemiIdx + 5 >= static_cast<int>(fields.size())) {
-      AG_LOGW(TAG,
-              "GNSS poll #%" PRIu32 ": complete payload but unexpected layout (fields=%zu)",
-              pollCount, fields.size());
-      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
-      elapsed += pollIntervalMs;
-      continue;
-    }
-
-    const std::string &latRaw = fields[hemiIdx - 1];
-    const std::string &nsRaw = fields[hemiIdx];
-    const std::string &lonRaw = fields[hemiIdx + 1];
-    const std::string &ewRaw = fields[hemiIdx + 2];
-    const std::string &dateRaw = fields[hemiIdx + 3];
-    const std::string &utcRaw = fields[hemiIdx + 4];
-    const std::string &altRaw = fields[hemiIdx + 5];
-
-    double lat = 0.0, lon = 0.0;
-    if (!_gnssParseCoord(latRaw, nsRaw, lat) ||
-        !_gnssParseCoord(lonRaw, ewRaw, lon)) {
-      AG_LOGW(TAG,
-              "GNSS poll #%" PRIu32 ": coord parse failed (lat=%s%s lon=%s%s)",
-              pollCount, latRaw.c_str(), nsRaw.c_str(), lonRaw.c_str(),
-              ewRaw.c_str());
-      vTaskDelay(pdMS_TO_TICKS(pollIntervalMs));
-      elapsed += pollIntervalMs;
-      continue;
+    if (hemiIdx >= 1 && hemiIdx + 5 < static_cast<int>(fields.size())) {
+      const std::string &latRaw = fields[hemiIdx - 1];
+      const std::string &nsRaw = fields[hemiIdx];
+      const std::string &lonRaw = fields[hemiIdx + 1];
+      const std::string &ewRaw = fields[hemiIdx + 2];
+      const std::string &altRaw = fields[hemiIdx + 5];
+      if (_gnssParseCoord(latRaw, nsRaw, lat) &&
+          _gnssParseCoord(lonRaw, ewRaw, lon)) {
+        hasPosition = true;
+        if (!altRaw.empty()) {
+          char *endp = nullptr;
+          float a = std::strtof(altRaw.c_str(), &endp);
+          if (endp != altRaw.c_str()) alt = a;
+        }
+      } else {
+        AG_LOGW(TAG,
+                "GNSS poll #%" PRIu32 ": coord parse failed, returning time-only "
+                "(lat=%s%s lon=%s%s)",
+                pollCount, latRaw.c_str(), nsRaw.c_str(), lonRaw.c_str(),
+                ewRaw.c_str());
+      }
     }
 
     result.data.valid = true;
+    result.data.hasPosition = hasPosition;
     result.data.latitude = lat;
     result.data.longitude = lon;
-    if (altRaw.empty()) {
-      result.data.altitudeMeters = 0.0f;
-    } else {
-      char *endp = nullptr;
-      float alt = std::strtof(altRaw.c_str(), &endp);
-      result.data.altitudeMeters = (endp == altRaw.c_str()) ? 0.0f : alt;
-    }
+    result.data.altitudeMeters = alt;
     std::snprintf(result.data.dateUTC, sizeof(result.data.dateUTC), "%s", dateRaw.c_str());
     std::snprintf(result.data.timeUTC, sizeof(result.data.timeUTC), "%s", utcRaw.c_str());
     result.status = CellReturnStatus::Ok;

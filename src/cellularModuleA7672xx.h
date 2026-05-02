@@ -124,6 +124,7 @@ public:
   bool gnssColdStart();
   bool gnssHotStart();
   bool gnssAgps();
+  bool gnssEnableNmea(bool enable);
   CellResult<CellularModule::GnssFix> gnssGetFix(uint32_t fixTimeoutMs = 90000,
                                                  GnssTickCb onTick = nullptr);
 
